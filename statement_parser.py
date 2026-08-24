@@ -160,7 +160,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "description": [
         "description", "particulars", "details", "narrative", "transaction",
-        "transaction details", "payment type and details", "type", "merchant",
+        "transaction details", "payment type and details", "merchant",
         "payee", "memo", "narration", "reference", "your reference",
         "payment details", "counterparty", "activity", "what",
     ],
@@ -178,6 +178,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         # generic
         "credit", "credits", "cr", "inflow", "received",
     ],
+    "code": ["type", "transaction type", "tran type", "code", "trans type"],
     "amount": ["amount", "amount £", "value", "transaction amount", "amt", "amount (gbp)"],
     "balance": [
         "balance", "running balance", "closing balance", "balance £",
@@ -288,8 +289,9 @@ def detect_layout(lines: list[list[dict]]) -> PageLayout:
         used_x: list[float] = []
         i = 0
         while i < len(line):
-            # try 3-word, then 2-word, then 1-word header phrases
-            for span in (3, 2, 1):
+            # longest heading phrase wins, so "Payment type and details" is read as
+            # one description heading rather than a stray "type" column
+            for span in (4, 3, 2, 1):
                 chunk = line[i:i + span]
                 if len(chunk) < span:
                     continue
@@ -398,7 +400,8 @@ def bucket(line: list[dict], layout: PageLayout) -> dict[str, str]:
 NOISE_RE = re.compile(
     r"^(page \d+|continued|statement of account|opening balance|closing balance|"
     r"(balance )?brought forward|(balance )?carried forward|b/?f|c/?f|total|subtotal|"
-    r"end of statement|www\.|tel[:.]|registered (office|in)|sort code|account (no|number))",
+    r"end of statement|www\.|https?:|tel[:.]|registered (office|in)|sort code|"
+    r"account (no|number))",
     re.I,
 )
 
@@ -452,10 +455,11 @@ class StatementParser:
                 if layout.is_usable() and len(layout.columns) >= self.opt.min_columns_confidence:
                     self._layout = layout
                     seps = row_separators(page, layout)
+                    got, mode = [], ""
                     if len(seps) >= 2:
                         got = self._parse_ruled(lines, layout, seps, pno)
                         mode = f"ruled-row mode ({'/'.join(c.name for c in layout.columns)})"
-                    else:
+                    if not got or not getattr(self, "_ruled_ok", True):
                         got = self._parse_columns(lines, layout, pno)
                         mode = f"column mode ({'/'.join(c.name for c in layout.columns)})"
                 elif getattr(self, "_layout", None) is not None:
@@ -463,8 +467,9 @@ class StatementParser:
                     # found, but only accept rows that carry a balance
                     prev = self._layout
                     seps = row_separators(page, prev)
-                    got = (self._parse_ruled(lines, prev, seps, pno) if len(seps) >= 2
-                           else self._parse_columns(lines, prev, pno))
+                    got = self._parse_ruled(lines, prev, seps, pno) if len(seps) >= 2 else []
+                    if not got or not getattr(self, "_ruled_ok", True):
+                        got = self._parse_columns(lines, prev, pno)
                     got = [r for r in got if r.get("Balance") is not None]
                     mode = ("continuation page" if got else "no transaction table - skipped")
                 elif self.looks_like_blocks(lines):
@@ -518,6 +523,7 @@ class StatementParser:
             row = {
                 "Date": dt,
                 "Description": (desc_cell + " " + " ".join(spill)).strip(),
+                "Code": cells.get("code", ""),
                 "Debit": values["debit"],
                 "Credit": values["credit"],
                 "Amount": values["amount"],
@@ -585,9 +591,20 @@ class StatementParser:
                 bands.setdefault(idx, []).append(line)
 
         rows: list[dict] = []
+        self._ruled_ok = True
+        money_col = next((c.name for c in layout.columns if c.name == "balance"), None)
         for idx in sorted(bands):
             words = sorted((w for line in bands[idx] for w in line),
                            key=lambda w: (round(w["top"], 1), w["x0"]))
+            if money_col:
+                # a genuine row band holds at most one balance figure; more than one
+                # means these rules are page furniture, not row separators
+                n = sum(1 for w in words
+                        if looks_like_amount(w["text"], strict=True)
+                        and any(c.name == money_col and c.x0 <= (w["x0"] + w["x1"]) / 2 < c.x1
+                                for c in layout.columns))
+                if n > 1:
+                    self._ruled_ok = False
             row = self._row_from_words(words, layout, pno)
             if row:
                 rows.append(row)
@@ -651,6 +668,7 @@ class StatementParser:
             return None                      # BROUGHT FORWARD / carried balance
 
         return {"Date": dt, "Description": desc,
+                "Code": " ".join(w["text"] for n, w in assigned if n == "code").strip(),
                 "Debit": abs(values["debit"]) if values["debit"] is not None else None,
                 "Credit": abs(values["credit"]) if values["credit"] is not None else None,
                 "Amount": values["amount"], "Balance": values["balance"], "Page": pno}
@@ -681,6 +699,7 @@ class StatementParser:
             return None      # BROUGHT FORWARD / carried balance rows
 
         return {"Date": dt, "Description": desc,
+                "Code": " ".join(w["text"] for n, w in assigned if n == "code").strip(),
                 "Debit": abs(values["debit"]) if values["debit"] is not None else None,
                 "Credit": abs(values["credit"]) if values["credit"] is not None else None,
                 "Amount": values["amount"], "Balance": values["balance"], "Page": pno}
@@ -838,13 +857,31 @@ class StatementParser:
             lambda v: "Credit" if pd.notna(v) and v > 0 else ("Debit" if pd.notna(v) else "")
         )
         df = df.dropna(subset=["Date"])
+        df = self._to_chronological(df)
         df = df[~((df["Amount"].isna()) & (df["Balance"].isna()))]
-        cols = ["Date", "Description", "Debit", "Credit", "Amount", "Balance", "Type", "Page", "Source File"]
+        if "Code" in df and not df["Code"].astype(str).str.strip().any():
+            df = df.drop(columns=["Code"])
+        cols = ["Date", "Description", "Code", "Debit", "Credit", "Amount",
+                "Balance", "Type", "Page", "Source File"]
         return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
+
+    def _to_chronological(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Some banks (TSB, most challenger apps) print the newest transaction first.
+        The running balance only makes sense oldest-first, so flip the whole table -
+        reversing rather than sorting keeps same-day transactions in the right order."""
+        if len(df) < 3:
+            return df
+        d = df["Date"].tolist()
+        down = sum(1 for a, b in zip(d, d[1:]) if b < a)
+        up = sum(1 for a, b in zip(d, d[1:]) if b > a)
+        if down > up:
+            self.log.append("Statement is printed newest-first - order reversed")
+            df = df.iloc[::-1].reset_index(drop=True)
+        return df
 
     @staticmethod
     def _empty() -> pd.DataFrame:
-        return pd.DataFrame(columns=["Date", "Description", "Debit", "Credit",
+        return pd.DataFrame(columns=["Date", "Description", "Code", "Debit", "Credit",
                                      "Amount", "Balance", "Type", "Page", "Source File"])
 
 
