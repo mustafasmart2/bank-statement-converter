@@ -102,7 +102,10 @@ for name, msg in failures:
 if not frames:
     st.stop()
 
-data = pd.concat(frames, ignore_index=True).sort_values(["Source File", "Date"]).reset_index(drop=True)
+data = pd.concat(frames, ignore_index=True)
+# stable sort only - it must not disturb the order of same-day transactions,
+# which is what makes the running balance check work
+data = data.sort_values(["Source File", "Date"], kind="stable").reset_index(drop=True)
 check = reconcile(data) if data["Source File"].nunique() == 1 else None
 
 # ---------------------------------------------------------------- summary
@@ -137,6 +140,7 @@ edited = st.data_editor(
         "Credit": st.column_config.NumberColumn("Credit", format="%.2f"),
         "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
         "Balance": st.column_config.NumberColumn("Balance", format="%.2f"),
+        "Code": st.column_config.TextColumn("Code", width="small"),
     },
     height=440,
 )
