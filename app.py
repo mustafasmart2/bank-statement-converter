@@ -61,6 +61,10 @@ with st.sidebar:
     )
     invert = st.checkbox("Flip debit / credit",
                          help="Tick this only if money-in and money-out come out the wrong way round.")
+    use_ocr = st.checkbox(
+        "Read image-only PDFs (OCR)", value=True,
+        help="Needed for scans, and for PDFs whose text was flattened to shapes. "
+             "Slower, and figures should be spot-checked.")
     flavour = st.selectbox("Export layout", EXPORT_FLAVOURS,
                            format_func=lambda s: s.title())
     st.divider()
@@ -75,9 +79,9 @@ if not files:
             "with a **Source File** column so you can tell them apart.")
     st.stop()
 
-opts = Options(dayfirst=dayfirst, default_year=int(default_year), invert=invert)
+opts = Options(dayfirst=dayfirst, default_year=int(default_year), invert=invert, ocr=use_ocr)
 
-frames, logs, failures = [], [], []
+frames, logs, failures, ocr_used = [], [], [], []
 progress = st.progress(0.0, text="Reading…")
 for i, f in enumerate(files, start=1):
     progress.progress(i / len(files), text=f"Reading {f.name}…")
@@ -85,9 +89,12 @@ for i, f in enumerate(files, start=1):
     try:
         df = parser.parse(io.BytesIO(f.getvalue()), password=password or None, source=f.name)
         if df.empty:
-            failures.append((f.name, "No transactions found. The PDF may be a scan — see the README on OCR."))
+            failures.append((f.name, "No transactions found. If this PDF is a scan, tick "
+                                     "\u201cRead image-only PDFs (OCR)\u201d in the sidebar."))
         else:
             frames.append(df)
+            if parser.used_ocr:
+                ocr_used.append(f.name)
         logs.append((f.name, parser.log))
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
@@ -114,6 +121,11 @@ c1.metric("Transactions", len(data))
 c2.metric("Money in", f"{data['Credit'].fillna(0).sum():,.2f}")
 c3.metric("Money out", f"{data['Debit'].fillna(0).sum():,.2f}")
 c4.metric("Net", f"{data['Amount'].fillna(0).sum():,.2f}")
+
+if ocr_used:
+    st.info("Read by OCR (no text layer): " + ", ".join(ocr_used) +
+            ". The running-balance check below is your assurance the figures came "
+            "through correctly - spot-check anything it flags.")
 
 if check:
     (st.success if check["ok"] else st.warning)(check["message"])
