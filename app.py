@@ -4,8 +4,8 @@ app.py — drag-and-drop web UI.
 Run it:   streamlit run app.py
 Opens at: http://localhost:8501
 
-Each uploaded PDF keeps its own tab, its own balance check and its own download
-buttons. Nothing is merged unless you ask for it.
+Drop in one PDF or twenty. With more than one, you are asked whether to merge them
+into a single table or keep each statement separate on its own tab.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ st.markdown(
       .stDownloadButton button {{ background: {GREEN}; color: white; border: 0; }}
       .stDownloadButton button:hover {{ background: #58a52f; color: white; }}
       div[data-testid="stMetricValue"] {{ font-size: 1.3rem; }}
-      button[data-baseweb="tab"] {{ font-size: 0.9rem; }}
+      button[data-baseweb="tab"] {{ min-width: 3rem; justify-content: center; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -91,8 +91,8 @@ with st.sidebar:
 files = st.file_uploader("Drop your PDF statements here", type=["pdf"], accept_multiple_files=True)
 
 if not files:
-    st.info("Upload one or more PDF statements. Each file gets its own tab, its own "
-            "balance check and its own download buttons.")
+    st.info("Upload one or more PDF statements. With more than one you'll be asked "
+            "whether to merge them or keep them separate.")
     st.stop()
 
 opts = Options(dayfirst=dayfirst,
@@ -105,13 +105,10 @@ progress = st.progress(0.0, text="Reading…")
 for i, f in enumerate(files, start=1):
     progress.progress(i / len(files), text=f"Reading {f.name}…")
     parser = StatementParser(opts)
-    entry = {"name": f.name, "df": None, "error": None,
-             "log": [], "bank": None, "ocr": False}
+    entry = {"name": f.name, "df": None, "error": None, "log": [], "bank": None, "ocr": False}
     try:
         df = parser.parse(io.BytesIO(f.getvalue()), password=password or None, source=f.name)
-        entry["log"] = parser.log
-        entry["bank"] = parser.bank
-        entry["ocr"] = parser.used_ocr
+        entry.update(log=parser.log, bank=parser.bank, ocr=parser.used_ocr)
         if df.empty:
             entry["error"] = ("No transactions found. If this PDF is a scan, tick "
                               "\u201cRead image-only PDFs (OCR)\u201d in the sidebar.")
@@ -126,9 +123,7 @@ for i, f in enumerate(files, start=1):
 progress.empty()
 
 good = [r for r in results if r["df"] is not None]
-bad = [r for r in results if r["df"] is None]
-
-for r in bad:
+for r in (r for r in results if r["df"] is None):
     st.error(f"**{r['name']}** — {r['error']}")
 
 if not good:
@@ -137,32 +132,107 @@ if not good:
 for r in good:
     r["check"] = reconcile(r["df"])
 
-# ---------------------------------------------------------------- overview
-clean = sum(1 for r in good if r["check"]["ok"])
-total_txns = sum(len(r["df"]) for r in good)
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Files converted", f"{len(good)} of {len(results)}")
-c2.metric("Transactions", f"{total_txns:,}")
-c3.metric("Files passing the balance check", f"{clean} of {len(good)}")
-
 stamp = datetime.now().strftime("%Y%m%d-%H%M")
 
-# ---------------------------------------------------------------- per file
-st.divider()
-tabs = st.tabs([r["name"] for r in good])
+# ---------------------------------------------------------------- merge or not
+batch_key = tuple(sorted(r["name"] for r in good))
+if len(good) == 1:
+    merge = False
+else:
+    if st.session_state.get("batch_key") != batch_key:
+        st.session_state.pop("merge", None)
+        st.session_state["batch_key"] = batch_key
+
+    if "merge" not in st.session_state:
+        with st.container(border=True):
+            st.subheader(f"{len(good)} statements read — {sum(len(r['df']) for r in good):,} transactions")
+            st.write("Do you want to merge all transactions into **one** Excel / CSV file?")
+            st.caption("Merged gives you a single table with a **Source File** column. "
+                       "Separate gives each statement its own tab, its own balance check "
+                       "and its own download.")
+            yes, no, _ = st.columns([1, 1, 4])
+            if yes.button("Yes, merge them", type="primary", use_container_width=True):
+                st.session_state["merge"] = True
+                st.rerun()
+            if no.button("No, keep separate", use_container_width=True):
+                st.session_state["merge"] = False
+                st.rerun()
+        st.stop()
+
+    merge = st.session_state["merge"]
+    label = "merged into one file" if merge else "kept separate"
+    left, right = st.columns([5, 1])
+    left.caption(f"{len(good)} statements, {label}.")
+    if right.button("Change", use_container_width=True):
+        del st.session_state["merge"]
+        st.rerun()
+
+# ================================================================ MERGED VIEW
+if merge:
+    data = pd.concat([r["df"] for r in good], ignore_index=True)
+    data = data.sort_values(["Source File", "Date"], kind="stable").reset_index(drop=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Transactions", f"{len(data):,}")
+    c2.metric("Money in", f"{data['Credit'].fillna(0).sum():,.2f}")
+    c3.metric("Money out", f"{data['Debit'].fillna(0).sum():,.2f}")
+    c4.metric("Net", f"{data['Amount'].fillna(0).sum():,.2f}")
+
+    failed = [r for r in good if not r["check"]["ok"]]
+    if failed:
+        st.warning("These statements have rows that don't tie to their running balance: "
+                   + ", ".join(f"**{r['name']}** ({len(r['check']['mismatches'])})" for r in failed))
+    else:
+        st.success(f"Every row in all {len(good)} statements ties to its running balance.")
+
+    if any(r["ocr"] for r in good):
+        st.info("Read by OCR (no text layer): "
+                + ", ".join(r["name"] for r in good if r["ocr"]))
+
+    st.caption("The balance check runs per statement — a merged table has no single "
+               "running balance, since each account has its own.")
+
+    edited = st.data_editor(
+        data, use_container_width=True, hide_index=True, num_rows="dynamic",
+        key="editor-merged",
+        column_config={
+            "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+            "Debit": st.column_config.NumberColumn("Debit", format="%.2f"),
+            "Credit": st.column_config.NumberColumn("Credit", format="%.2f"),
+            "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "Balance": st.column_config.NumberColumn("Balance", format="%.2f"),
+            "Code": st.column_config.TextColumn("Code", width="small"),
+        },
+        height=480,
+    )
+
+    d1, d2, _ = st.columns([1, 1, 2])
+    d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited)),
+                       f"statements-merged-{stamp}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
+    d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour),
+                       f"statements-merged-{stamp}.csv", "text/csv",
+                       use_container_width=True)
+    st.stop()
+
+# ================================================================ SEPARATE VIEW
+if len(good) > 1:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Files", len(good))
+    c2.metric("Transactions", f"{sum(len(r['df']) for r in good):,}")
+    c3.metric("Passing the balance check",
+              f"{sum(1 for r in good if r['check']['ok'])} of {len(good)}")
+    st.divider()
+
+tabs = st.tabs([str(i) for i in range(1, len(good) + 1)])
 
 for tab, r in zip(tabs, good):
     with tab:
         df, check = r["df"], r["check"]
         stem = safe_name(r["name"])
 
-        head = st.columns(4)
-        head[0].metric("Transactions", len(df))
-        head[1].metric("Money in", f"{df['Credit'].fillna(0).sum():,.2f}")
-        head[2].metric("Money out", f"{df['Debit'].fillna(0).sum():,.2f}")
-        head[3].metric("Net", f"{df['Amount'].fillna(0).sum():,.2f}")
-
+        st.markdown(f"#### {r['name']}")
         bits = []
         if r["bank"]:
             bits.append(f"Bank: **{r['bank']}**")
@@ -170,6 +240,12 @@ for tab, r in zip(tabs, good):
             bits.append(f"Opening **{check['opening']:,.2f}** → closing **{check['closing']:,.2f}**")
         if bits:
             st.caption("  ·  ".join(bits))
+
+        head = st.columns(4)
+        head[0].metric("Transactions", len(df))
+        head[1].metric("Money in", f"{df['Credit'].fillna(0).sum():,.2f}")
+        head[2].metric("Money out", f"{df['Debit'].fillna(0).sum():,.2f}")
+        head[3].metric("Net", f"{df['Amount'].fillna(0).sum():,.2f}")
 
         if r["ocr"]:
             st.info("This PDF had no text in it, so it was read with OCR. The balance "
@@ -199,19 +275,20 @@ for tab, r in zip(tabs, good):
         r["edited"] = edited
 
         d1, d2, _ = st.columns([1, 1, 2])
-        d1.download_button(
-            "Download Excel", to_excel_bytes(edited, reconcile(edited)),
-            f"{stem}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key=f"xlsx-{stem}")
-        d2.download_button(
-            f"Download CSV ({flavour})", to_accounting_csv(edited, flavour),
-            f"{stem}.csv", "text/csv",
-            use_container_width=True, key=f"csv-{stem}")
+        d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited)),
+                           f"{stem}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, key=f"xlsx-{stem}")
+        d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour),
+                           f"{stem}.csv", "text/csv",
+                           use_container_width=True, key=f"csv-{stem}")
 
         with st.expander("How this PDF was read"):
             for line in r["log"]:
                 st.text(line)
+
+if len(good) == 1:
+    st.stop()
 
 # ---------------------------------------------------------------- download all
 st.divider()
@@ -257,7 +334,7 @@ a1, a2, a3 = st.columns(3)
 a1.download_button("All Excel files (.zip)", zip_of("xlsx"),
                    f"statements-excel-{stamp}.zip", "application/zip",
                    use_container_width=True, key="zip-xlsx")
-a2.download_button(f"All CSV files (.zip)", zip_of("csv"),
+a2.download_button("All CSV files (.zip)", zip_of("csv"),
                    f"statements-csv-{stamp}.zip", "application/zip",
                    use_container_width=True, key="zip-csv")
 a3.download_button("One workbook, a sheet per file", one_workbook(),
