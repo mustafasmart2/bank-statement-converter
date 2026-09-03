@@ -1144,7 +1144,8 @@ def reconcile(df: pd.DataFrame, tolerance: float = 0.02) -> dict:
 # 7. Export
 # --------------------------------------------------------------------------
 
-def to_excel_bytes(df: pd.DataFrame, check: dict | None = None) -> bytes:
+def to_excel_bytes(df: pd.DataFrame, check: dict | None = None,
+                   date_format: str = "DD/MM/YYYY") -> bytes:
     buf = io.BytesIO()
     out = df.copy()
     if "Date" in out:
@@ -1160,6 +1161,10 @@ def to_excel_bytes(df: pd.DataFrame, check: dict | None = None) -> bytes:
             if col in {"Debit", "Credit", "Amount", "Balance"}:
                 for r in range(2, len(out) + 2):
                     ws.cell(row=r, column=i).number_format = "#,##0.00"
+            elif col == "Date":
+                # Excel holds a real date; without this it shows as yyyy-mm-dd
+                for r in range(2, len(out) + 2):
+                    ws.cell(row=r, column=i).number_format = date_format
         ws.freeze_panes = "A2"
 
         if check:
@@ -1176,14 +1181,27 @@ def to_excel_bytes(df: pd.DataFrame, check: dict | None = None) -> bytes:
             xl.sheets["Summary"].column_dimensions["A"].width = 22
             xl.sheets["Summary"].column_dimensions["B"].width = 60
             if check.get("mismatches"):
-                pd.DataFrame(check["mismatches"]).to_excel(xl, sheet_name="Check Failures", index=False)
+                fails = pd.DataFrame(check["mismatches"])
+                if "date" in fails:
+                    fails["date"] = pd.to_datetime(fails["date"]).dt.date
+                fails.to_excel(xl, sheet_name="Check Failures", index=False)
+                fw = xl.sheets["Check Failures"]
+                for i, col in enumerate(fails.columns, start=1):
+                    if col == "date":
+                        for r in range(2, len(fails) + 2):
+                            fw.cell(row=r, column=i).number_format = date_format
+                    elif col in {"expected", "found", "diff"}:
+                        for r in range(2, len(fails) + 2):
+                            fw.cell(row=r, column=i).number_format = "#,##0.00"
+                fw.column_dimensions["C"].width = 42
     return buf.getvalue()
 
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
+def to_csv_bytes(df: pd.DataFrame, dayfirst: bool = True) -> bytes:
     out = df.copy()
     if "Date" in out:
-        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime(
+            "%d/%m/%Y" if dayfirst else "%m/%d/%Y")
     return out.to_csv(index=False).encode("utf-8")
 
 
@@ -1191,7 +1209,8 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 # 8. Accounting-software export flavours
 # --------------------------------------------------------------------------
 
-def to_accounting_csv(df: pd.DataFrame, flavour: str = "standard") -> bytes:
+def to_accounting_csv(df: pd.DataFrame, flavour: str = "standard",
+                      dayfirst: bool = True) -> bytes:
     """Reshape into the layout each package expects on import."""
     d = df.copy()
     d["Date"] = pd.to_datetime(d["Date"])
@@ -1220,7 +1239,7 @@ def to_accounting_csv(df: pd.DataFrame, flavour: str = "standard") -> bytes:
             "Credit": d["Credit"].round(2),
         })
     else:
-        return to_csv_bytes(df)
+        return to_csv_bytes(df, dayfirst)
     return out.to_csv(index=False).encode("utf-8")
 
 
