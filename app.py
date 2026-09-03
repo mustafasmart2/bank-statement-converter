@@ -95,6 +95,8 @@ if not files:
             "whether to merge them or keep them separate.")
     st.stop()
 
+xl_date_fmt = "DD/MM/YYYY" if dayfirst else "MM/DD/YYYY"
+
 opts = Options(dayfirst=dayfirst,
                default_year=int(default_year) if default_year else None,
                invert=invert, ocr=use_ocr)
@@ -207,11 +209,11 @@ if merge:
     )
 
     d1, d2, _ = st.columns([1, 1, 2])
-    d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited)),
+    d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited), date_format=xl_date_fmt),
                        f"statements-merged-{stamp}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True)
-    d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour),
+    d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour, dayfirst),
                        f"statements-merged-{stamp}.csv", "text/csv",
                        use_container_width=True)
     st.stop()
@@ -275,11 +277,11 @@ for tab, r in zip(tabs, good):
         r["edited"] = edited
 
         d1, d2, _ = st.columns([1, 1, 2])
-        d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited)),
+        d1.download_button("Download Excel", to_excel_bytes(edited, reconcile(edited), date_format=xl_date_fmt),
                            f"{stem}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True, key=f"xlsx-{stem}")
-        d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour),
+        d2.download_button(f"Download CSV ({flavour})", to_accounting_csv(edited, flavour, dayfirst),
                            f"{stem}.csv", "text/csv",
                            use_container_width=True, key=f"csv-{stem}")
 
@@ -302,9 +304,9 @@ def zip_of(kind: str) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for stem, d in frames.items():
             if kind == "csv":
-                z.writestr(f"{stem}.csv", to_accounting_csv(d, flavour))
+                z.writestr(f"{stem}.csv", to_accounting_csv(d, flavour, dayfirst))
             else:
-                z.writestr(f"{stem}.xlsx", to_excel_bytes(d, reconcile(d)))
+                z.writestr(f"{stem}.xlsx", to_excel_bytes(d, reconcile(d), date_format=xl_date_fmt))
     return buf.getvalue()
 
 
@@ -325,8 +327,15 @@ def one_workbook() -> bytes:
             ws = xl.sheets[sheet]
             ws.freeze_panes = "A2"
             for i, col in enumerate(out.columns, start=1):
-                letter = ws.cell(row=1, column=i).column_letter
-                ws.column_dimensions[letter].width = 52 if col == "Description" else 14
+                cell = ws.cell(row=1, column=i)
+                ws.column_dimensions[cell.column_letter].width = (
+                    52 if col == "Description" else 14)
+                if col == "Date":
+                    for r in range(2, len(out) + 2):
+                        ws.cell(row=r, column=i).number_format = xl_date_fmt
+                elif col in {"Debit", "Credit", "Amount", "Balance"}:
+                    for r in range(2, len(out) + 2):
+                        ws.cell(row=r, column=i).number_format = "#,##0.00"
     return buf.getvalue()
 
 
