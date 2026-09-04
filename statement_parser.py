@@ -86,7 +86,7 @@ AMOUNT_RE = re.compile(
         (?P<cur>[$£€₹]|Rs\.?|AED|USD|GBP|PKR|CAD)?\s?
         (?P<num>\d{1,3}(?:[,\s]\d{3})+(?:\.\d{1,2})?|\d+\.\d{1,2}|\d+)
         (?P<close>\))?
-        \s?(?P<drcr>DR|CR|Dr|Cr)?
+        \s?(?P<drcr>DR|CR|OD|Dr|Cr|Od)?
         (?P<trail>-)?
         (?![\w/])""",
     re.VERBOSE,
@@ -106,8 +106,8 @@ def to_number(token: str) -> float | None:
     except ValueError:
         return None
     negative = bool(m.group("open")) or m.group("sign") == "-" or bool(m.group("trail"))
-    if (m.group("drcr") or "").upper() == "DR":
-        negative = True
+    if (m.group("drcr") or "").upper() in {"DR", "OD"}:
+        negative = True          # OD = overdrawn: the balance is money owed
     return -val if negative else val
 
 
@@ -116,7 +116,7 @@ def to_number(token: str) -> float | None:
 FORMATTED_MONEY_RE = re.compile(
     r"^[\(\-+]?\s?[$£€₹]?\s?(?:Rs\.?\s?)?"
     r"(?:\d{1,3}(?:[,\s]\d{3})+(?:\.\d{1,2})?|\d+\.\d{1,2})"
-    r"\)?\s?(?:DR|CR|Dr|Cr)?-?$"
+    r"\)?\s?(?:DR|CR|OD|Dr|Cr|Od)?-?$"
 )
 
 
@@ -133,7 +133,7 @@ def looks_like_amount(token: str, strict: bool = True) -> bool:
 
 def trailing_amounts(line: str, max_n: int = 4) -> tuple[str, list[float]]:
     """Strip money tokens off the right-hand end. Returns (remaining_text, values)."""
-    tokens = line.split()
+    tokens = fold_sign_markers(line.split())
     values: list[float] = []
     while tokens and len(values) < max_n and looks_like_amount(tokens[-1], strict=True):
         tok = tokens.pop()
@@ -368,6 +368,20 @@ def detect_layout(lines: list[list[dict]]) -> PageLayout:
 
 NUMERIC_COLS = {"debit", "credit", "amount", "balance"}
 
+# Loan and overdraft statements print the sign as a separate word after the figure:
+# "449,197.64  OD". On its own it is meaningless, so it has to be folded back on.
+SIGN_MARKERS = {"OD", "DR", "CR", "Od", "Dr", "Cr", "od", "dr", "cr"}
+
+
+def fold_sign_markers(tokens: list[str]) -> list[str]:
+    out: list[str] = []
+    for t in tokens:
+        if out and t in SIGN_MARKERS and looks_like_amount(out[-1], strict=True):
+            out[-1] += t.upper()
+        else:
+            out.append(t)
+    return out
+
 
 def _widen(layout: PageLayout) -> None:
     """Turn heading positions into gap-free catchment bands.
@@ -429,7 +443,7 @@ def clean_numeric_cell(cell: str) -> tuple[float | None, str]:
     Return (value, leftover_text_to_give_back_to_the_description)."""
     if not cell:
         return None, ""
-    tokens = cell.split()
+    tokens = fold_sign_markers(cell.split())
     money_idx = [i for i, t in enumerate(tokens) if looks_like_amount(t, strict=True)]
     if not money_idx:
         return None, cell
@@ -857,8 +871,16 @@ class StatementParser:
         for w in words:
             cx = (w["x0"] + w["x1"]) / 2
             name = next((c.name for c in layout.columns if c.x0 <= cx < c.x1), None)
-            if name:
-                assigned.append((name, w))
+            if not name:
+                continue
+            if (assigned and name == assigned[-1][0] and name in NUMERIC_COLS
+                    and w["text"] in SIGN_MARKERS
+                    and looks_like_amount(assigned[-1][1]["text"], strict=True)):
+                prev = assigned[-1][1]
+                prev["text"] += w["text"].upper()
+                prev["x1"] = w["x1"]
+                continue
+            assigned.append((name, dict(w)))
 
         date_text = " ".join(w["text"] for n, w in assigned if n == "date")
         dt, raw = parse_date(date_text, self.opt.dayfirst, self.opt.default_year)
