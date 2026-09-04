@@ -1,0 +1,19 @@
+# Streamlit Cloud runs many apps on one machine and the Linux inotify limit gets
+# used up, so the file watcher fails to start and the app can hang on a blank page:
+#   OSError: [Errno 24] inotify instance limit reached
+# The watcher only exists to hot-reload the app while you edit code locally.
+# Turning it off costs nothing in production - a redeploy still picks up changes.
+
+[server]
+fileWatcherType = "none"
+runOnSave = false
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true
+
+[theme]
+primaryColor = "#2D99D0"
