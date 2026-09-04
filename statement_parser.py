@@ -220,25 +220,59 @@ def detect_bank(text: str) -> str | None:
     return None
 
 
-# Statements often print dates without a year ("3 Apr"). The year lives in the
-# statement period line at the top of page 1.
+# Statements often print dates without a year ("6 Aug"). The year lives in the
+# statement period line at the top of the page. Reading it off a bare four-digit
+# number is not safe - an IBAN like "GB70 BUKB 2021 7803 7696 82" looks just like
+# a year - so only real dates count.
+DATE_WITH_YEAR_RE = re.compile(
+    r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\.?\s+(20\d{2})\b"
+    r"|\b[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+(20\d{2})\b"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-](20\d{2})\b"
+    r"|\b(20\d{2})-\d{2}-\d{2}\b")
+
+# "20 Sep - 20 Oct 2025" or "20 Dec 2025 - 20 Jan 2026": the first year, when the
+# range crosses a new year, is the one transactions start in.
+PERIOD_RANGE_RE = re.compile(
+    r"\d{1,2}\s+[A-Za-z]{3,9}\.?\s*(20\d{2})?\s*(?:-|–|to)\s*"
+    r"\d{1,2}\s+[A-Za-z]{3,9}\.?\s*(20\d{2})?", re.I)
+
 PERIOD_YEAR_RE = re.compile(
     r"(?:statement|period|from|between|for the period)[^\n]{0,80}?(20\d{2})", re.I)
 
 
+def _first_year(match) -> int | None:
+    for g in match.groups():
+        if g:
+            return int(g)
+    return None
+
+
 def detect_statement_year(text: str) -> int | None:
-    m = PERIOD_YEAR_RE.search(text[:3000])
+    """The year transactions on this page should start in."""
+    head = text[:3000]
+
+    for m in PERIOD_RANGE_RE.finditer(head):
+        # the range may be split across lines by the table heading, so the end
+        # year can go missing - take whichever year survived
+        year = m.group(1) or m.group(2)
+        if year:
+            return int(year)
+
+    m = PERIOD_YEAR_RE.search(head)
     if m:
         return int(m.group(1))
-    years = re.findall(r"\b(20[1-4]\d)\b", text[:1500])
-    return int(years[0]) if years else None
+
+    m = DATE_WITH_YEAR_RE.search(head)
+    if m:
+        return _first_year(m)
+    return None
 
 
 HEADING_NOISE_RE = re.compile(r"\((?:£|\$|€|gbp|usd|eur|aed|pkr)\)|[£$€₹]|[():|.,*]", re.I)
 
 
 def normalise_heading(text: str) -> str:
-    """'Paid In(£)' -> 'paid in', 'Withdrawn(£)' -> 'withdrawn', 'Balance(£):' -> 'balance'."""
+    """'Paid In(£)' -> 'paid in', 'Withdrawn(£)' -> 'withdrawn', 'Balance £:' -> 'balance'."""
     out = HEADING_NOISE_RE.sub(" ", text.lower())
     return re.sub(r"\s+", " ", out).strip()
 
@@ -269,6 +303,22 @@ class PageLayout:
         return "date" in n and has_money
 
 
+def glue_split_words(line: list[dict], max_gap: float = 1.2) -> list[dict]:
+    """Some PDFs break a word across several text runs, so "16 Jan" arrives as
+    "1", "6", "Jan". Anything separated by less than a normal space is one word."""
+    out: list[dict] = []
+    for w in line:
+        if out and 0 <= w["x0"] - out[-1]["x1"] < max_gap:
+            prev = out[-1]
+            prev["text"] += w["text"]
+            prev["x1"] = w["x1"]
+            prev["top"] = min(prev["top"], w["top"])
+            prev["bottom"] = max(prev["bottom"], w["bottom"])
+        else:
+            out.append(dict(w))
+    return out
+
+
 def group_words_into_lines(words: list[dict], tol: float = 2.5) -> list[list[dict]]:
     """Group pdfplumber words into visual lines by their 'top' coordinate."""
     lines: list[list[dict]] = []
@@ -277,9 +327,7 @@ def group_words_into_lines(words: list[dict], tol: float = 2.5) -> list[list[dic
             lines[-1].append(w)
         else:
             lines.append([w])
-    for ln in lines:
-        ln.sort(key=lambda w: w["x0"])
-    return lines
+    return [glue_split_words(sorted(ln, key=lambda w: w["x0"])) for ln in lines]
 
 
 def detect_layout(lines: list[list[dict]]) -> PageLayout:
@@ -488,6 +536,7 @@ class StatementParser:
         self.log: list[str] = []
         self.bank: str | None = None
         self.used_ocr = False
+        self._page_year: int | None = None
 
     @staticmethod
     def _raw_bytes(file) -> bytes | None:
@@ -526,7 +575,9 @@ class StatementParser:
                 if not words:
                     self.log.append(f"Page {pno}: no readable text - skipped")
                     continue
-                pages.append((pno, group_words_into_lines(words), page))
+                text = page.extract_text() or " ".join(w["text"] for w in words)
+                pages.append((pno, group_words_into_lines(words), page,
+                              detect_statement_year(text)))
 
         self.bank = detect_bank(first_text)
         if self.bank:
@@ -544,7 +595,7 @@ class StatementParser:
         # the first page, and every later page uses the same geometry.
         layouts: dict[int, PageLayout] = {}
         carried: PageLayout | None = None
-        for pno, lines, _ in pages:
+        for pno, lines, _, _y in pages:
             found = detect_layout(lines)
             if found.is_usable() and len(found.columns) >= self.opt.min_columns_confidence:
                 carried = found
@@ -559,10 +610,16 @@ class StatementParser:
         for name in ("gaps", "ruled", "lines"):
             rows: list[dict] = []
             self._last_date = None
-            for pno, lines, page in pages:
+            self._page_year = None
+            for pno, lines, page, year_hint in pages:
                 layout = layouts.get(pno)
                 if layout is None:
                     continue
+                if year_hint:
+                    # a new statement starts here: re-anchor the year instead of
+                    # carrying it on from the previous statement in the file
+                    self._page_year = year_hint
+                    self._last_date = None
                 if name == "ruled":
                     seps = row_separators(page, layout)
                     if len(seps) < 2:
@@ -595,7 +652,11 @@ class StatementParser:
         """No heading row anywhere: date-anchored lines, or labelled blocks."""
         rows: list[dict] = []
         self._last_date = None
-        for pno, lines, _ in pages:
+        self._page_year = None
+        for pno, lines, _, year_hint in pages:
+            if year_hint:
+                self._page_year = year_hint
+                self._last_date = None
             if self.looks_like_blocks(lines):
                 rows.extend(self._parse_blocks(lines, pno))
             else:
@@ -758,7 +819,8 @@ class StatementParser:
         if date_has_year(raw or ""):
             return dt
         if prev is None:
-            return dt
+            year = getattr(self, "_page_year", None) or self.opt.default_year
+            return dt.replace(year=year) if year else dt
         candidate = dt.replace(year=prev.year)
         if (prev - candidate).days > 60:          # wrapped into the new year
             candidate = candidate.replace(year=prev.year + 1)
